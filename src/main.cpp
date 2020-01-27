@@ -1,69 +1,66 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP8266WebServer.h>
 #include <PubSubClient.h>
-//#include <NewPing.h>
+#include <NewPing.h>
+#include <Wire.h>
+#include <Smoothed.h>
 
-#define TRIGGER_PIN 7 // Arduino pin tied to trigger pin on the ultrasonic sensor.
-#define ECHO_PIN 6    // Arduino pin tied to echo pin on the ultrasonic sensor.
+#define TRIGGER_PIN 14 // Arduino pin tied to trigger pin on the ultrasonic sensor.
+#define ECHO_PIN 12    // Arduino pin tied to echo pin on the ultrasonic sensor.
 
 #define NUM_ROWS 2
 #define NUM_COLUMNS 16
 
-#define WIDTH 200  //ancho en cm
-#define LENGTH 200 //ancho en cm
-#define BASE_AREA WIDTH *LENGTH
-#define MAX_DISTANCE 200 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
+#define SECONDS 1000
 
-#define MQTT_TOPIC_LINK "/level/monitor/link"
-#define MQTT_TOPIC_STATUS "/level/monitor/status"
+#define MQTT_TOPIC_LINK         "/level/monitor/link"
+#define MQTT_TOPIC_STATUS       "/level/monitor/status"
+
+#define MQTT_TOPIC_SUBSCRIBE      "/level/control/#"
+#define MQTT_SUB_TOPIC_VOLUME     "/level/control/volume"
+#define MQTT_SUB_TOPIC_RESTART    "/level/control/restart"
+#define MQTT_SUB_TOPIC_ENABLEMQTT "/level/control/enablemqtt"
+#define MQTT_SUB_TOPIC_SENSORAVG  "/level/control/sensoravg"
+#define MQTT_SUB_TOPIC_TIMERMQTT  "/level/control/timermqtt"
+#define MQTT_SUB_TOPIC_MINDISTANCE  "/level/control/mindistance"
+#define MQTT_SUB_TOPIC_MAXDISTANCE  "/level/control/maxdistance"
+
 #define MQTT_MAX_ATTEMPS 10
 
 // initialize the library with the numbers of the interface pins
-LiquidCrystal_I2C lcd(0x27, NUM_ROWS, NUM_COLUMNS); // set the LCD address to 0x27 for a 16 chars and 2 line display
-//NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+LiquidCrystal_I2C lcd(0x27, NUM_ROWS, NUM_COLUMNS);
 
-int level = 0;
-int liters = 0; //volumen en litros
-int level_percent = 100;
+Smoothed<float> sensorAvg;
+Smoothed<float> sensorExp;
+float currentSensorValue;
+bool sensorAverage = true;
+
+float max_volume = 7000;
+float max_distance = 1700;
+float min_distance = 250;
+float bottom = 0;
+
+float level = 0;
+int volume = 0; //volumen en litros
+int level_percent = 0;
+float level_factor = 0;
+
+unsigned long statusTimer;
+unsigned int timerMqtt = 5;
 
 bool mqttConnected = false;
+bool enableMqtt = true;
+
 String DeviceID = "";
 
 WiFiClient wifi_client;
 PubSubClient mqtt_client(wifi_client);
 
-//DUMMY LEVEL DATA
-int dummy_level = 0;
-bool up = true;
-
-int simularNivel()
-{
-  if (up)
-  {
-    dummy_level++;
-    if (dummy_level > 199)
-    {
-      up = false;
-    }
-  }
-  else
-  {
-    dummy_level--;
-    if (dummy_level < 1)
-    {
-      up = true;
-    }
-  }
-
-  return dummy_level;
-}
-
 void wifi_connect()
 {
   WiFi.mode(WIFI_STA);
-  WiFi.begin("AUTOM", "since1968");
+  WiFi.begin("MONTFLOR", "2129612842");
   // Wait for connection
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -97,6 +94,19 @@ void mqtt_publish(const char *topic, const char *payload)
   }
 }
 
+bool mqtt_subscribe(const char *topic)
+{
+  String topic_buf = DeviceID + topic;
+  if (mqtt_client.subscribe(topic_buf.c_str()))
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
 void mqtt_callback(char *_topic, byte *payload, unsigned int length)
 {
   /* TOPIC */
@@ -111,6 +121,69 @@ void mqtt_callback(char *_topic, byte *payload, unsigned int length)
   }
 
   /* VERIFICACION DE TOPIC */
+  //RESTART
+  if (topic == DeviceID + MQTT_SUB_TOPIC_RESTART)
+  {
+    if (messageTemp.toInt())
+    {
+      ESP.restart();
+    }
+  }
+  //VOLUME
+  if (topic == DeviceID + MQTT_SUB_TOPIC_VOLUME)
+  {
+    if (messageTemp.toInt())
+    {
+      max_volume = messageTemp.toInt();
+    }
+  }
+  //MIN_DISTANCE
+  if (topic == DeviceID + MQTT_SUB_TOPIC_MINDISTANCE)
+  {
+    if (messageTemp.toInt())
+    {
+      min_distance = messageTemp.toInt(); // in mm
+    }
+  }
+  //MAX_DISTANCE
+  if (topic == DeviceID + MQTT_SUB_TOPIC_MAXDISTANCE)
+  {
+    if (messageTemp.toInt())
+    {
+      max_distance = messageTemp.toInt(); // in mm
+    }
+  }
+  //TIMER MQTT
+  if (topic == DeviceID + MQTT_SUB_TOPIC_TIMERMQTT)
+  {
+    if (messageTemp.toInt())
+    {
+      timerMqtt = messageTemp.toInt(); // in seconds
+    }
+  }
+
+  //ENABLEMQTT
+  if (topic == DeviceID + MQTT_SUB_TOPIC_ENABLEMQTT)
+  {
+    if (messageTemp.toInt())
+    {
+      enableMqtt = false;
+    }
+    else{
+      enableMqtt = false;
+    }
+  }
+  //Select smoother
+  if (topic == DeviceID + MQTT_SUB_TOPIC_SENSORAVG)
+  {
+    if (messageTemp.toInt())
+    {
+      sensorAverage = true;
+    }
+    else{
+      sensorAverage = false;
+    }
+  }
 }
 
 void mqtt_connect()
@@ -131,6 +204,8 @@ void mqtt_connect()
       {
         Serial.println("conexion a Broker MQTT exitosa");
         mqtt_publish(MQTT_TOPIC_LINK, "Connected");
+
+        mqtt_subscribe(MQTT_TOPIC_SUBSCRIBE);
       }
       else
       {
@@ -144,7 +219,6 @@ void mqtt_connect()
   }
 }
 
-
 // Conectar MQTT
 void mqtt_start()
 {
@@ -156,12 +230,22 @@ void mqtt_start()
   mqtt_connect();
 }
 
-
-
-
-void mqtt_status(){
-  String payload = "{\"level\":" + String(level_percent) + ", \"liters\":" + String(liters) +"}";
+void mqtt_status()
+{
+  String payload = "{\"level\":" + String(level) + ", \"level_percent\":" + String(level_percent) + ", \"liters\":" + String(volume) + "}";
   mqtt_publish(MQTT_TOPIC_STATUS, payload.c_str());
+}
+
+unsigned long readDistance()
+{
+  unsigned long duration;
+  digitalWrite(TRIGGER_PIN, LOW);
+  delayMicroseconds(100);
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(150);
+  digitalWrite(TRIGGER_PIN, LOW);
+  duration = pulseIn(ECHO_PIN, HIGH);
+  return duration / 5.82; //This is in mm
 }
 
 void setup()
@@ -171,6 +255,11 @@ void setup()
   lcd.backlight();    //open the backlight
   wifi_connect();
   mqtt_start();
+  statusTimer = millis();
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  sensorAvg.begin(SMOOTHED_AVERAGE, 12);
+  sensorExp.begin(SMOOTHED_EXPONENTIAL, 12);
 }
 
 void loop()
@@ -189,36 +278,53 @@ void loop()
   }
   mqtt_client.loop();
 
-  //level =  MAX_DISTANCE - sonar.ping_cm();
-  level = MAX_DISTANCE - simularNivel();
-  level_percent = map(level, 0, MAX_DISTANCE, 0, 100);
-  liters = level * BASE_AREA / 1000;
+  bottom = min_distance + max_distance;
 
-  Serial.println("Level: " + String(level) + "cm, " + String(level_percent) + "%, Liters: " + String(liters));
+  currentSensorValue = readDistance();
+  if(sensorAverage){
+    sensorAvg.add(currentSensorValue);
+    level = bottom - sensorAvg.get();
+  }
+  else{
+    sensorExp.add(currentSensorValue);
+    level = bottom - sensorExp.get();
+  }
+  
+  level_factor = level / max_distance;
+  level_percent = int(100 * level_factor);
+  volume = level_factor * max_volume;
+
+  Serial.println("Level: " + String(currentSensorValue) + "mm, " + String(level_percent) + "%, volume: " + String(volume));
 
   lcd.setCursor(0, 0);
-  lcd.print("Liters=");
+  lcd.print("Lvl:");
+  lcd.setCursor(4, 0);
+  lcd.print("    ");
+  lcd.setCursor(4, 0);
+  lcd.print(int(level));
   lcd.setCursor(8, 0);
-  lcd.print("       ");
-  lcd.setCursor(8, 0);
-  lcd.print(liters);
-  lcd.setCursor(14, 0);
-  lcd.print("%");
-  lcd.setCursor(0, 1);
-  lcd.print("Level=");
-
-  lcd.setCursor(6, 1);
-  lcd.print("    "); // clears 8, 9 & 10 position
-  lcd.setCursor(6, 1);
-  lcd.print(level);
-  lcd.setCursor(10, 1);
-  lcd.print("cm");
-  lcd.setCursor(13, 1);
-  lcd.print("   ");
-  lcd.setCursor(13, 1);
+  lcd.print("mm");
+  lcd.setCursor(10, 0);
+  lcd.print("      ");
+  lcd.setCursor(12, 0);
   lcd.print(level_percent);
+  lcd.setCursor(15, 0);
+  lcd.print("%");
 
-  mqtt_status();
+  lcd.setCursor(0, 1);
+  lcd.print("Vol:");
+  lcd.setCursor(4, 1);
+  lcd.print("    ");
+  lcd.setCursor(4, 1);
+  lcd.print(int(volume));
+  lcd.setCursor(8, 1);
+  lcd.print("L       ");
 
-  delay(5000);
+  if (enableMqtt && (millis() - statusTimer > (timerMqtt * SECONDS)))
+  {
+    mqtt_status();
+    statusTimer = millis();
+  }
+
+  delay(2000);
 }
