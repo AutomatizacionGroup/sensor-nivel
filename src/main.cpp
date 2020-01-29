@@ -2,9 +2,10 @@
 #include <LiquidCrystal_I2C.h>
 #include <ESP8266WebServer.h>
 #include <PubSubClient.h>
-#include <NewPing.h>
 #include <Wire.h>
 #include <Smoothed.h>
+#include <StorageESP8266.h>
+#include <ArduinoJson.h>
 
 #define TRIGGER_PIN 14 // Arduino pin tied to trigger pin on the ultrasonic sensor.
 #define ECHO_PIN 12    // Arduino pin tied to echo pin on the ultrasonic sensor.
@@ -14,17 +15,21 @@
 
 #define SECONDS 1000
 
-#define MQTT_TOPIC_LINK         "/level/monitor/link"
-#define MQTT_TOPIC_STATUS       "/level/monitor/status"
+#define MQTT_TOPIC_LINK "/level/monitor/link"
+#define MQTT_TOPIC_STATUS "/level/monitor/status"
+#define MQTT_TOPIC_SETTINGS "/level/monitor/settings"
 
-#define MQTT_TOPIC_SUBSCRIBE      "/level/control/#"
-#define MQTT_SUB_TOPIC_VOLUME     "/level/control/volume"
-#define MQTT_SUB_TOPIC_RESTART    "/level/control/restart"
+#define MQTT_TOPIC_SUBSCRIBE "/level/control/#"
+#define MQTT_SUB_TOPIC_SETTINGS "/level/control/settings"
+#define MQTT_SUB_TOPIC_VOLUME "/level/control/volume"
+#define MQTT_SUB_TOPIC_RESTART "/level/control/restart"
+#define MQTT_SUB_TOPIC_OFFSETSUP "/level/control/offsetsup"
+#define MQTT_SUB_TOPIC_OFFSETINF "/level/control/offsetinf"
 #define MQTT_SUB_TOPIC_ENABLEMQTT "/level/control/enablemqtt"
-#define MQTT_SUB_TOPIC_SENSORAVG  "/level/control/sensoravg"
-#define MQTT_SUB_TOPIC_TIMERMQTT  "/level/control/timermqtt"
-#define MQTT_SUB_TOPIC_MINDISTANCE  "/level/control/mindistance"
-#define MQTT_SUB_TOPIC_MAXDISTANCE  "/level/control/maxdistance"
+#define MQTT_SUB_TOPIC_SENSORAVG "/level/control/sensoravg"
+#define MQTT_SUB_TOPIC_TIMERMQTT "/level/control/timermqtt"
+#define MQTT_SUB_TOPIC_MINDISTANCE "/level/control/mindistance"
+#define MQTT_SUB_TOPIC_MAXDISTANCE "/level/control/maxdistance"
 
 #define MQTT_MAX_ATTEMPS 10
 
@@ -37,13 +42,16 @@ float currentSensorValue;
 bool sensorAverage = true;
 
 float max_volume = 7000;
-float max_distance = 1700;
+float max_distance = 1500;
 float min_distance = 250;
 float bottom = 0;
 
+float offset_sup = 0;
+float offset_inf = 0;
+
 float level = 0;
 int volume = 0; //volumen en litros
-int level_percent = 0;
+float level_percent = 0;
 float level_factor = 0;
 
 unsigned long statusTimer;
@@ -107,6 +115,26 @@ bool mqtt_subscribe(const char *topic)
   }
 }
 
+void mqtt_send_settings()
+{
+  const size_t settings_size = JSON_OBJECT_SIZE(10);
+  DynamicJsonDocument settingsJSON(settings_size);
+  char payload[200];
+  settingsJSON["max_volume"] = storage::getMaxVolume(); 
+  settingsJSON["max_distance"] = storage::getMaxDistance(); 
+  settingsJSON["min_distance"] = storage::getMinDistance(); 
+  settingsJSON["offset_sup"] = (float) 100 - offset_sup*100; 
+  settingsJSON["offset_inf"] = (float) offset_inf*100;
+  settingsJSON["timerMqtt"] = timerMqtt;
+  settingsJSON["sensorAverage"] = sensorAverage;
+  settingsJSON["enableMqtt"] = enableMqtt;
+
+  serializeJson(settingsJSON, payload);
+
+  mqtt_publish(MQTT_TOPIC_SETTINGS, payload);
+  settingsJSON.clear();
+}
+
 void mqtt_callback(char *_topic, byte *payload, unsigned int length)
 {
   /* TOPIC */
@@ -121,6 +149,11 @@ void mqtt_callback(char *_topic, byte *payload, unsigned int length)
   }
 
   /* VERIFICACION DE TOPIC */
+  // Settings
+  if (topic == DeviceID + MQTT_SUB_TOPIC_SETTINGS)
+  {
+    mqtt_send_settings();
+  }
   //RESTART
   if (topic == DeviceID + MQTT_SUB_TOPIC_RESTART)
   {
@@ -134,7 +167,9 @@ void mqtt_callback(char *_topic, byte *payload, unsigned int length)
   {
     if (messageTemp.toInt())
     {
-      max_volume = messageTemp.toInt();
+      storage::setMaxVolume(messageTemp.toInt());
+      max_volume = storage::getMaxVolume();
+      max_volume = max_volume - max_volume * offset_inf;
     }
   }
   //MIN_DISTANCE
@@ -142,7 +177,8 @@ void mqtt_callback(char *_topic, byte *payload, unsigned int length)
   {
     if (messageTemp.toInt())
     {
-      min_distance = messageTemp.toInt(); // in mm
+      storage::setMinDistance(messageTemp.toInt());
+      min_distance = storage::getMinDistance(); // in mm
     }
   }
   //MAX_DISTANCE
@@ -150,39 +186,47 @@ void mqtt_callback(char *_topic, byte *payload, unsigned int length)
   {
     if (messageTemp.toInt())
     {
-      max_distance = messageTemp.toInt(); // in mm
+      storage::setMaxDistance(messageTemp.toInt());
+      max_distance = storage::getMaxDistance(); // in mm
+      if (offset_sup != 0)
+      {
+        max_distance = max_distance * offset_sup;
+      }
     }
   }
+  //OFFSET SUP
+  if (topic == DeviceID + MQTT_SUB_TOPIC_OFFSETSUP)
+  {
+
+    storage::setOffsetSup(100 - messageTemp.toInt());
+    offset_sup = storage::getOffsetSup();
+  }
+  //OFFSET INF
+  if (topic == DeviceID + MQTT_SUB_TOPIC_OFFSETINF)
+  {
+    storage::setOffsetInf(messageTemp.toInt());
+    offset_inf = storage::getOffsetInf();
+  }
+
   //TIMER MQTT
   if (topic == DeviceID + MQTT_SUB_TOPIC_TIMERMQTT)
   {
-    if (messageTemp.toInt())
-    {
-      timerMqtt = messageTemp.toInt(); // in seconds
-    }
+    storage::setTimerMqtt(messageTemp.toInt());
+    timerMqtt = storage::getTimerMqtt(); // in seconds
   }
 
   //ENABLEMQTT
   if (topic == DeviceID + MQTT_SUB_TOPIC_ENABLEMQTT)
   {
-    if (messageTemp.toInt())
-    {
-      enableMqtt = false;
-    }
-    else{
-      enableMqtt = false;
-    }
+    storage::setEnableMqtt(messageTemp.toInt());
+    enableMqtt = storage::getEnableMqtt();
   }
+
   //Select smoother
   if (topic == DeviceID + MQTT_SUB_TOPIC_SENSORAVG)
   {
-    if (messageTemp.toInt())
-    {
-      sensorAverage = true;
-    }
-    else{
-      sensorAverage = false;
-    }
+    storage::setSensorAvg(messageTemp.toInt());
+    sensorAverage = storage::getSensorAvg();
   }
 }
 
@@ -251,15 +295,38 @@ unsigned long readDistance()
 void setup()
 {
   Serial.begin(9600); // Open serial monitor at 115200 baud to see ping results.
-  lcd.init();         //initialize the lcd
-  lcd.backlight();    //open the backlight
+  storage::init();
+
+  lcd.init();      //initialize the lcd
+  lcd.backlight(); //open the backlight
+
   wifi_connect();
   mqtt_start();
+
   statusTimer = millis();
+
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+
   sensorAvg.begin(SMOOTHED_AVERAGE, 12);
   sensorExp.begin(SMOOTHED_EXPONENTIAL, 12);
+
+  timerMqtt = storage::getTimerMqtt();
+  enableMqtt = storage::getEnableMqtt();
+  sensorAverage = storage::getSensorAvg();
+
+  offset_inf = storage::getOffsetInf(); //in decimal
+  offset_sup = storage::getOffsetSup(); //in decimal
+
+  max_volume = storage::getMaxVolume();
+  max_volume = max_volume - max_volume * offset_inf;
+
+  max_distance = storage::getMaxDistance(); // in mm
+  if (offset_sup != 0)
+  {
+    max_distance = max_distance * offset_sup;
+  }
+  min_distance = storage::getMinDistance();
 }
 
 void loop()
@@ -281,20 +348,24 @@ void loop()
   bottom = min_distance + max_distance;
 
   currentSensorValue = readDistance();
-  if(sensorAverage){
+  if (sensorAverage)
+  {
     sensorAvg.add(currentSensorValue);
     level = bottom - sensorAvg.get();
   }
-  else{
+  else
+  {
     sensorExp.add(currentSensorValue);
     level = bottom - sensorExp.get();
   }
-  
-  level_factor = level / max_distance;
-  level_percent = int(100 * level_factor);
+
+  level = level - offset_inf * max_distance; // restar offset
+
+  level_factor = level / max_distance; //
+  level_percent = 100 * level_factor;
   volume = level_factor * max_volume;
 
-  Serial.println("Level: " + String(currentSensorValue) + "mm, " + String(level_percent) + "%, volume: " + String(volume));
+  Serial.println("Level: " + String(level) + "mm, " + String(level_percent) + "%, volume: " + String(volume));
 
   lcd.setCursor(0, 0);
   lcd.print("Lvl:");
@@ -307,7 +378,7 @@ void loop()
   lcd.setCursor(10, 0);
   lcd.print("      ");
   lcd.setCursor(12, 0);
-  lcd.print(level_percent);
+  lcd.print(int(level_percent));
   lcd.setCursor(15, 0);
   lcd.print("%");
 
